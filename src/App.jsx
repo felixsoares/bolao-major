@@ -285,6 +285,8 @@ export default function App() {
   const [connectionError, setConnectionError] = useState('');
   const lastSavedStateRef = useRef('');
   const currentStateRef = useRef({ teams, stages, scoring });
+  const pendingStateRef = useRef('');
+  const stateSaveQueueRef = useRef(Promise.resolve());
   const skipLocalCacheRef = useRef(false);
 
   // Autenticação do Painel Admin
@@ -462,18 +464,32 @@ export default function App() {
     const serialized = JSON.stringify(state);
     if (serialized === lastSavedStateRef.current) return;
 
+    pendingStateRef.current = serialized;
+    let saveStarted = false;
     const timeout = setTimeout(async () => {
-      try {
-        await savePoolState(state);
-        lastSavedStateRef.current = serialized;
-        setConnectionError('');
-      } catch (error) {
-        console.error('Erro ao salvar dados no Supabase:', error);
-        setConnectionError(`Não foi possível salvar as alterações: ${error.message}`);
-      }
+      saveStarted = true;
+      const saveOperation = stateSaveQueueRef.current
+        .then(async () => {
+          await savePoolState(state);
+          lastSavedStateRef.current = serialized;
+          setConnectionError('');
+        })
+        .catch((error) => {
+          console.error('Erro ao salvar dados no Supabase:', error);
+          setConnectionError(`Não foi possível salvar as alterações: ${error.message}`);
+        })
+        .finally(() => {
+          if (pendingStateRef.current === serialized) pendingStateRef.current = '';
+        });
+      stateSaveQueueRef.current = saveOperation;
     }, 300);
 
-    return () => clearTimeout(timeout);
+    return () => {
+      clearTimeout(timeout);
+      if (!saveStarted && pendingStateRef.current === serialized) {
+        pendingStateRef.current = '';
+      }
+    };
   }, [teams, stages, scoring, isLoaded, isConnected]);
 
   // Mantém os dados locais como backup e a senha apenas neste navegador.
@@ -505,6 +521,7 @@ export default function App() {
           stages: state.stages,
           scoring: state.scoring,
         });
+        if (pendingStateRef.current) return;
         if (serialized === JSON.stringify(currentStateRef.current)) return;
 
         lastSavedStateRef.current = serialized;
