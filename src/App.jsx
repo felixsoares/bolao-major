@@ -2,11 +2,17 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { isSupabaseConfigured, supabase } from './lib/supabase';
 import {
   clearPicks,
+  deleteAllTeams,
+  deleteTeam,
   initializePool,
   loadPoolData,
+  replaceTeams,
   replacePicks,
+  saveTeam,
   savePick,
   savePoolState,
+  setStageTeamActive,
+  setStageTeamSelections,
   subscribeToPoolData,
 } from './lib/poolStore';
 import {
@@ -121,6 +127,14 @@ const createEmptyDraft = (stageType = 'swiss') =>
         advance: [],
         zeroThree: [],
       };
+
+const createPoolStateSnapshot = (stages, scoring) => ({
+  stages: stages.map(({ teamIds: _teamIds, ...stage }) => stage),
+  scoring,
+});
+
+const serializePoolState = (stages, scoring) =>
+  JSON.stringify(createPoolStateSnapshot(stages, scoring));
 
 // ============================================================================
 // COMPONENTE DE ESCUDO / LOGO DO TIME (SVG FALLBACK ELEGANTE + IMAGEM)
@@ -284,7 +298,7 @@ export default function App() {
   const [isConnected, setIsConnected] = useState(false);
   const [connectionError, setConnectionError] = useState('');
   const lastSavedStateRef = useRef('');
-  const currentStateRef = useRef({ teams, stages, scoring });
+  const currentStateRef = useRef({ stages, scoring });
   const pendingStateRef = useRef('');
   const stateSaveQueueRef = useRef(Promise.resolve());
   const skipLocalCacheRef = useRef(false);
@@ -333,8 +347,8 @@ export default function App() {
   };
 
   useEffect(() => {
-    currentStateRef.current = { teams, stages, scoring };
-  }, [teams, stages, scoring]);
+    currentStateRef.current = { stages, scoring };
+  }, [stages, scoring]);
 
   // Carrega os dados compartilhados e migra a cópia local na primeira conexão.
   useEffect(() => {
@@ -412,7 +426,7 @@ export default function App() {
           await initializePool({
             teams: Array.isArray(legacyData?.teams)
               ? legacyData.teams
-              : remoteData.state.teams,
+              : remoteData.teams,
             stages: legacyStages,
             scoring: legacyData?.scoring
               ? { ...DEFAULT_SCORING, ...legacyData.scoring }
@@ -423,7 +437,7 @@ export default function App() {
         }
 
         if (!active) return;
-        setTeams(remoteData.state.teams);
+        setTeams(remoteData.teams);
         setStages(remoteData.state.stages);
         setPicks(remoteData.picks);
         setScoring({ ...DEFAULT_SCORING, ...remoteData.state.scoring });
@@ -433,11 +447,10 @@ export default function App() {
         ) {
           setAdminPassword(legacyData.adminPassword);
         }
-        lastSavedStateRef.current = JSON.stringify({
-          teams: remoteData.state.teams,
-          stages: remoteData.state.stages,
-          scoring: remoteData.state.scoring,
-        });
+        lastSavedStateRef.current = serializePoolState(
+          remoteData.state.stages,
+          remoteData.state.scoring
+        );
         setIsConnected(true);
         setConnectionError('');
       } catch (error) {
@@ -460,8 +473,8 @@ export default function App() {
   useEffect(() => {
     if (!isLoaded || !isConnected || !supabase) return;
 
-    const state = { teams, stages, scoring };
-    const serialized = JSON.stringify(state);
+    const state = { stages, scoring };
+    const serialized = serializePoolState(stages, scoring);
     if (serialized === lastSavedStateRef.current) return;
 
     pendingStateRef.current = serialized;
@@ -490,7 +503,7 @@ export default function App() {
         pendingStateRef.current = '';
       }
     };
-  }, [teams, stages, scoring, isLoaded, isConnected]);
+  }, [stages, scoring, isLoaded, isConnected]);
 
   // Mantém os dados locais como backup e a senha apenas neste navegador.
   useEffect(() => {
@@ -516,18 +529,54 @@ export default function App() {
     return subscribeToPoolData({
       onState: (state) => {
         if (!state) return;
-        const serialized = JSON.stringify({
-          teams: state.teams,
-          stages: state.stages,
-          scoring: state.scoring,
-        });
+        const currentStages = currentStateRef.current.stages;
+        const nextStages = state.stages.map((stage) => ({
+          ...stage,
+          teamIds:
+            currentStages.find((currentStage) => currentStage.id === stage.id)?.teamIds || [],
+        }));
+        const serialized = serializePoolState(nextStages, state.scoring);
         if (pendingStateRef.current) return;
-        if (serialized === JSON.stringify(currentStateRef.current)) return;
+        if (
+          serialized ===
+          serializePoolState(currentStateRef.current.stages, currentStateRef.current.scoring)
+        ) {
+          return;
+        }
 
         lastSavedStateRef.current = serialized;
-        setTeams(state.teams);
-        setStages(state.stages);
+        setStages(nextStages);
         setScoring({ ...DEFAULT_SCORING, ...state.scoring });
+      },
+      onTeam: ({ eventType, team, oldId }) => {
+        if (eventType === 'DELETE') {
+          setTeams((previous) => previous.filter((item) => item.id !== oldId));
+          return;
+        }
+        if (!team) return;
+        setTeams((previous) => {
+          const exists = previous.some((item) => item.id === team.id);
+          return exists
+            ? previous.map((item) => (item.id === team.id ? team : item))
+            : [...previous, team];
+        });
+      },
+      onStageTeam: ({ stageId, teamId, isActive }) => {
+        if (!stageId || !teamId || typeof isActive !== 'boolean') return;
+        setStages((previous) =>
+          previous.map((stage) => {
+            if (stage.id !== stageId) return stage;
+            const currentIds = stage.teamIds || [];
+            const hasTeam = currentIds.includes(teamId);
+            if (isActive === hasTeam) return stage;
+            return {
+              ...stage,
+              teamIds: isActive
+                ? [...currentIds, teamId]
+                : currentIds.filter((id) => id !== teamId),
+            };
+          })
+        );
       },
       onPick: ({ eventType, pick, oldId }) => {
         if (eventType === 'DELETE') {
@@ -970,7 +1019,7 @@ export default function App() {
   };
 
   // 1. Cadastro / Edição / Remoção de Times
-  const handleSaveTeam = (e) => {
+  const handleSaveTeam = async (e) => {
     e.preventDefault();
     if (!requireAdmin()) return;
     const cleanName = newTeamName.trim();
@@ -979,28 +1028,38 @@ export default function App() {
       return;
     }
 
-    if (editingTeamId) {
-      setTeams((prev) =>
-        prev.map((t) =>
-          t.id === editingTeamId
-            ? {
-                ...t,
-                name: cleanName,
-                logoUrl: newTeamLogo.trim(),
-              }
-            : t
-        )
+    const teamBeingEdited = teams.find((team) => team.id === editingTeamId);
+    if (editingTeamId && !teamBeingEdited) {
+      showToast('O time que você está editando não foi encontrado.', 'error');
+      return;
+    }
+
+    const newTeam = editingTeamId
+      ? { ...teamBeingEdited, name: cleanName, logoUrl: newTeamLogo.trim() }
+      : {
+          id: `team-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          name: cleanName,
+          logoUrl: newTeamLogo.trim(),
+        };
+
+    try {
+      await saveTeam(
+        newTeam,
+        STAGE_DEFINITIONS.map((stage) => stage.id)
       );
-      showToast(`Time "${cleanName}" atualizado!`);
+      setTeams((previous) =>
+        editingTeamId
+          ? previous.map((team) => (team.id === editingTeamId ? newTeam : team))
+          : previous.some((team) => team.id === newTeam.id)
+            ? previous.map((team) => (team.id === newTeam.id ? newTeam : team))
+            : [...previous, newTeam]
+      );
+      showToast(`Time "${cleanName}" ${editingTeamId ? 'atualizado' : 'cadastrado'}!`);
       setEditingTeamId(null);
-    } else {
-      const newTeam = {
-        id: `team-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        name: cleanName,
-        logoUrl: newTeamLogo.trim(),
-      };
-      setTeams((prev) => [...prev, newTeam]);
-      showToast(`Time "${cleanName}" cadastrado!`);
+    } catch (error) {
+      console.error('Erro ao salvar time no Supabase:', error);
+      showToast(`Não foi possível salvar o time: ${error.message}`, 'error');
+      return;
     }
 
     setNewTeamName('');
@@ -1014,8 +1073,16 @@ export default function App() {
     setNewTeamLogo(team.logoUrl || '');
   };
 
-  const handleDeleteTeam = (teamId) => {
+  const handleDeleteTeam = async (teamId) => {
     if (!requireAdmin()) return;
+    try {
+      await deleteTeam(teamId);
+    } catch (error) {
+      console.error('Erro ao excluir time do Supabase:', error);
+      showToast(`Não foi possível excluir o time: ${error.message}`, 'error');
+      return;
+    }
+
     setTeams((prev) => prev.filter((t) => t.id !== teamId));
     setStages((prev) =>
       prev.map((st) => ({
@@ -1041,35 +1108,56 @@ export default function App() {
   };
 
   // 2. Definir Times de Cada Uma das 4 Rodadas
-  const handleToggleTeamInStage = (stageId, teamId) => {
+  const handleToggleTeamInStage = async (stageId, teamId) => {
     if (!requireAdmin()) return;
-    setStages((prev) =>
-      prev.map((st) => {
-        if (st.id !== stageId) return st;
-        const currentIds = st.teamIds || [];
-        const exists = currentIds.includes(teamId);
-        return {
-          ...st,
-          teamIds: exists
-            ? currentIds.filter((id) => id !== teamId)
-            : [...currentIds, teamId],
-        };
-      })
-    );
+    const stage = stages.find((item) => item.id === stageId);
+    if (!stage) return;
+    const isActive = !(stage.teamIds || []).includes(teamId);
+
+    try {
+      await setStageTeamActive(stageId, teamId, isActive);
+      setStages((previous) =>
+        previous.map((item) => {
+          if (item.id !== stageId) return item;
+          const currentIds = item.teamIds || [];
+          return {
+            ...item,
+            teamIds: isActive
+              ? currentIds.includes(teamId)
+                ? currentIds
+                : [...currentIds, teamId]
+              : currentIds.filter((id) => id !== teamId),
+          };
+        })
+      );
+    } catch (error) {
+      console.error('Erro ao atualizar time da fase:', error);
+      showToast(`Não foi possível atualizar o time na fase: ${error.message}`, 'error');
+    }
   };
 
-  const handleSelectAllTeamsForStage = (stageId) => {
+  const handleSelectAllTeamsForStage = async (stageId) => {
     if (!requireAdmin()) return;
-    setStages((prev) =>
-      prev.map((st) => {
-        if (st.id !== stageId) return st;
-        const allSelected = teams.length > 0 && st.teamIds.length === teams.length;
-        return {
-          ...st,
-          teamIds: allSelected ? [] : teams.map((t) => t.id),
-        };
-      })
-    );
+    const stage = stages.find((item) => item.id === stageId);
+    if (!stage) return;
+    const allSelected = teams.length > 0 && stage.teamIds.length === teams.length;
+    const selectedTeamIds = allSelected ? [] : teams.map((team) => team.id);
+
+    try {
+      await setStageTeamSelections(
+        stageId,
+        selectedTeamIds,
+        teams.map((team) => team.id)
+      );
+      setStages((previous) =>
+        previous.map((item) =>
+          item.id === stageId ? { ...item, teamIds: selectedTeamIds } : item
+        )
+      );
+    } catch (error) {
+      console.error('Erro ao atualizar times da fase:', error);
+      showToast(`Não foi possível atualizar os times da fase: ${error.message}`, 'error');
+    }
   };
 
   const handleToggleStageLock = (stageId) => {
@@ -1224,16 +1312,12 @@ export default function App() {
 
     try {
       await savePoolState({
-        teams: parsed.teams,
         stages: parsed.stages,
         scoring: nextScoring,
       });
+      await replaceTeams(parsed.teams, parsed.stages);
       await replacePicks(parsed.picks);
-      lastSavedStateRef.current = JSON.stringify({
-        teams: parsed.teams,
-        stages: parsed.stages,
-        scoring: nextScoring,
-      });
+      lastSavedStateRef.current = serializePoolState(parsed.stages, nextScoring);
       setTeams(parsed.teams);
       setStages(parsed.stages);
       setPicks(parsed.picks);
@@ -1259,10 +1343,10 @@ export default function App() {
     const emptyStages = createEmptyStages();
     try {
       await savePoolState({
-        teams: [],
         stages: emptyStages,
         scoring: DEFAULT_SCORING,
       });
+      await deleteAllTeams();
       await clearPicks();
     } catch (error) {
       console.error('Erro ao limpar dados do Supabase:', error);
@@ -1279,11 +1363,7 @@ export default function App() {
       console.error('Erro ao limpar a cópia local:', error);
     }
 
-    lastSavedStateRef.current = JSON.stringify({
-      teams: [],
-      stages: emptyStages,
-      scoring: DEFAULT_SCORING,
-    });
+    lastSavedStateRef.current = serializePoolState(emptyStages, DEFAULT_SCORING);
     setTeams([]);
     setStages(emptyStages);
     setPicks([]);
