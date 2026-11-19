@@ -1,16 +1,20 @@
-# React + Vite
+# Bolão Singapura
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+Aplicação React/Vite para palpites do Major de CS2, com dados compartilhados pelo Supabase.
 
-Currently, two official plugins are available:
+## Configuração do Supabase
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+1. No Supabase, abra o **SQL Editor**, cole e execute `supabase/schema.sql`.
+2. Copie `.env.example` para `.env.local` e preencha `VITE_SUPABASE_URL` e `VITE_SUPABASE_PUBLISHABLE_KEY` com os valores do projeto Supabase.
+3. Execute `npm install` e `npm run dev`.
+4. No primeiro acesso, os dados antigos deste navegador são migrados para o banco se ele ainda não tiver sido inicializado.
+5. No Vercel, configure as mesmas variáveis em **Settings → Environment Variables** e faça um novo deploy.
 
-## React Compiler
+O schema habilita leitura e escrita públicas para as tabelas `pool_state` e `picks`, conforme a configuração escolhida para este bolão. Qualquer pessoa poderá alterar os dados diretamente; a senha do painel é apenas uma barreira visual e não é salva no banco.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## Comandos
 
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and Oxlint's TypeScript related rules in your project.
+- `npm run dev`: inicia o servidor local.
+- `npm run build`: gera os arquivos de produção na pasta `dist`.
+- `npm run preview`: testa localmente o build de produção.
+- `npm run lint`: executa o Oxlint.

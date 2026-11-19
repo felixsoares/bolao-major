@@ -1,4 +1,14 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { isSupabaseConfigured, supabase } from './lib/supabase';
+import {
+  clearPicks,
+  initializePool,
+  loadPoolData,
+  replacePicks,
+  savePick,
+  savePoolState,
+  subscribeToPoolData,
+} from './lib/poolStore';
 import {
   Trophy,
   Shield,
@@ -263,7 +273,7 @@ const calculatePickScore = (pickEntry, stage, scoring) => {
 // ============================================================================
 
 export default function App() {
-  // Estado principal persistido no localStorage (inicia vazio para configuração do Admin)
+  // Estado principal compartilhado pelo Supabase.
   const [teams, setTeams] = useState([]);
   const [stages, setStages] = useState(createEmptyStages);
   const [picks, setPicks] = useState([]);
@@ -271,6 +281,11 @@ export default function App() {
   const [adminPassword, setAdminPassword] = useState(DEFAULT_ADMIN_PASSWORD);
   const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(false);
   const [isLoaded, setIsLoaded] = useState(false);
+  const [isConnected, setIsConnected] = useState(false);
+  const [connectionError, setConnectionError] = useState('');
+  const lastSavedStateRef = useRef('');
+  const currentStateRef = useRef({ teams, stages, scoring });
+  const skipLocalCacheRef = useRef(false);
 
   // Autenticação do Painel Admin
   const [passwordInput, setPasswordInput] = useState('');
@@ -315,64 +330,210 @@ export default function App() {
     }, 3800);
   };
 
-  // Carregar dados iniciais do localStorage (sem dados fictícios caso vazio)
   useEffect(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed.teams)) setTeams(parsed.teams);
-        if (Array.isArray(parsed.stages) && parsed.stages.length > 0) {
-          // Garante que as 4 fases obrigatórias existam
-          const mergedStages = STAGE_DEFINITIONS.map((def) => {
-            const existing = parsed.stages.find((s) => s.id === def.id);
-            return existing
-              ? {
-                  ...def,
-                  ...existing,
-                  type: def.type,
-                  name: def.name,
-                  results:
-                    def.type === 'playoffs'
-                      ? {
-                          champion: existing.results?.champion || null,
-                          finalists: existing.results?.finalists || [],
-                          semifinalists: existing.results?.semifinalists || [],
-                        }
-                      : {
-                          threeZero: existing.results?.threeZero || [],
-                          advance: existing.results?.advance || [],
-                          zeroThree: existing.results?.zeroThree || [],
-                        },
-                }
-              : createEmptyStages().find((s) => s.id === def.id);
-          });
-          setStages(mergedStages);
-        }
-        if (Array.isArray(parsed.picks)) setPicks(parsed.picks);
-        if (parsed.scoring) setScoring({ ...DEFAULT_SCORING, ...parsed.scoring });
-        if (typeof parsed.adminPassword === 'string' && parsed.adminPassword.length > 0) {
-          setAdminPassword(parsed.adminPassword);
-        }
+    currentStateRef.current = { teams, stages, scoring };
+  }, [teams, stages, scoring]);
+
+  // Carrega os dados compartilhados e migra a cópia local na primeira conexão.
+  useEffect(() => {
+    let active = true;
+
+    const load = async () => {
+      if (!isSupabaseConfigured) {
+        setConnectionError(
+          'Configure VITE_SUPABASE_URL e VITE_SUPABASE_PUBLISHABLE_KEY para conectar o banco.'
+        );
+        setIsLoaded(true);
+        return;
       }
-    } catch (err) {
-      console.error('Erro ao ler localStorage:', err);
-    }
-    setIsLoaded(true);
+
+      try {
+        let legacyData = null;
+        const saved = localStorage.getItem(STORAGE_KEY);
+        if (saved) {
+          try {
+            legacyData = JSON.parse(saved);
+          } catch (error) {
+            console.error('Erro ao ler os dados locais antigos:', error);
+          }
+        }
+
+        let remoteData = await loadPoolData();
+        const hasLegacyPoolData =
+          (Array.isArray(legacyData?.teams) && legacyData.teams.length > 0) ||
+          (Array.isArray(legacyData?.stages) &&
+            legacyData.stages.some(
+              (stage) =>
+                stage.isLocked ||
+                stage.teamIds?.length ||
+                stage.results?.threeZero?.length ||
+                stage.results?.advance?.length ||
+                stage.results?.zeroThree?.length ||
+                stage.results?.champion ||
+                stage.results?.finalists?.length ||
+                stage.results?.semifinalists?.length
+            )) ||
+          Object.entries(DEFAULT_SCORING).some(
+            ([key, value]) => legacyData?.scoring?.[key] !== undefined && legacyData.scoring[key] !== value
+          );
+
+        if (!remoteData.state.initialized && hasLegacyPoolData) {
+          const legacyStages =
+            Array.isArray(legacyData?.stages) && legacyData.stages.length > 0
+              ? STAGE_DEFINITIONS.map((definition) => {
+                  const existing = legacyData.stages.find(
+                    (stage) => stage.id === definition.id
+                  );
+                  return existing
+                    ? {
+                        ...definition,
+                        ...existing,
+                        type: definition.type,
+                        name: definition.name,
+                        results:
+                          definition.type === 'playoffs'
+                            ? {
+                                champion: existing.results?.champion || null,
+                                finalists: existing.results?.finalists || [],
+                                semifinalists: existing.results?.semifinalists || [],
+                              }
+                            : {
+                                threeZero: existing.results?.threeZero || [],
+                                advance: existing.results?.advance || [],
+                                zeroThree: existing.results?.zeroThree || [],
+                              },
+                      }
+                    : createEmptyStages().find((stage) => stage.id === definition.id);
+                })
+              : remoteData.state.stages;
+
+          await initializePool({
+            teams: Array.isArray(legacyData?.teams)
+              ? legacyData.teams
+              : remoteData.state.teams,
+            stages: legacyStages,
+            scoring: legacyData?.scoring
+              ? { ...DEFAULT_SCORING, ...legacyData.scoring }
+              : remoteData.state.scoring,
+            picks: Array.isArray(legacyData?.picks) ? legacyData.picks : [],
+          });
+          remoteData = await loadPoolData();
+        }
+
+        if (!active) return;
+        setTeams(remoteData.state.teams);
+        setStages(remoteData.state.stages);
+        setPicks(remoteData.picks);
+        setScoring({ ...DEFAULT_SCORING, ...remoteData.state.scoring });
+        if (
+          typeof legacyData?.adminPassword === 'string' &&
+          legacyData.adminPassword.length > 0
+        ) {
+          setAdminPassword(legacyData.adminPassword);
+        }
+        lastSavedStateRef.current = JSON.stringify({
+          teams: remoteData.state.teams,
+          stages: remoteData.state.stages,
+          scoring: remoteData.state.scoring,
+        });
+        setIsConnected(true);
+        setConnectionError('');
+      } catch (error) {
+        console.error('Erro ao carregar dados do Supabase:', error);
+        if (active) {
+          setConnectionError(`Não foi possível carregar os dados do Supabase: ${error.message}`);
+        }
+      } finally {
+        if (active) setIsLoaded(true);
+      }
+    };
+
+    load();
+    return () => {
+      active = false;
+    };
   }, []);
 
-  // Salvar no localStorage sempre que houver mudanças
+  // Mantém equipes, fases e pontuação sincronizadas entre os participantes.
   useEffect(() => {
-    if (!isLoaded) return;
+    if (!isLoaded || !isConnected || !supabase) return;
+
+    const state = { teams, stages, scoring };
+    const serialized = JSON.stringify(state);
+    if (serialized === lastSavedStateRef.current) return;
+
+    const timeout = setTimeout(async () => {
+      try {
+        await savePoolState(state);
+        lastSavedStateRef.current = serialized;
+        setConnectionError('');
+      } catch (error) {
+        console.error('Erro ao salvar dados no Supabase:', error);
+        setConnectionError(`Não foi possível salvar as alterações: ${error.message}`);
+      }
+    }, 300);
+
+    return () => clearTimeout(timeout);
+  }, [teams, stages, scoring, isLoaded, isConnected]);
+
+  // Mantém os dados locais como backup e a senha apenas neste navegador.
+  useEffect(() => {
+    if (!isLoaded || !isConnected) return;
+    if (skipLocalCacheRef.current) {
+      skipLocalCacheRef.current = false;
+      return;
+    }
     try {
       localStorage.setItem(
         STORAGE_KEY,
         JSON.stringify({ teams, stages, picks, scoring, adminPassword })
       );
-    } catch (err) {
-      console.error('Erro ao salvar no localStorage:', err);
+    } catch (error) {
+      console.error('Erro ao salvar cópia local:', error);
     }
-  }, [teams, stages, picks, scoring, adminPassword, isLoaded]);
+  }, [teams, stages, picks, scoring, adminPassword, isLoaded, isConnected]);
+
+  // Atualiza as telas abertas quando outro visitante altera os dados.
+  useEffect(() => {
+    if (!isLoaded || !isConnected || !supabase) return undefined;
+
+    return subscribeToPoolData({
+      onState: (state) => {
+        if (!state) return;
+        const serialized = JSON.stringify({
+          teams: state.teams,
+          stages: state.stages,
+          scoring: state.scoring,
+        });
+        if (serialized === JSON.stringify(currentStateRef.current)) return;
+
+        lastSavedStateRef.current = serialized;
+        setTeams(state.teams);
+        setStages(state.stages);
+        setScoring({ ...DEFAULT_SCORING, ...state.scoring });
+      },
+      onPick: ({ eventType, pick, oldId }) => {
+        if (eventType === 'DELETE') {
+          setPicks((previous) => previous.filter((item) => item.id !== oldId));
+          return;
+        }
+        if (!pick) return;
+        setPicks((previous) => {
+          const existingIndex = previous.findIndex(
+            (item) =>
+              item.id === pick.id ||
+              (item.stageId === pick.stageId &&
+                item.userName.toLowerCase() === pick.userName.toLowerCase())
+          );
+          const next = [...previous];
+          if (existingIndex >= 0) next.splice(existingIndex, 1);
+          return [pick, ...next].sort(
+            (a, b) => new Date(b.updatedAt) - new Date(a.updatedAt)
+          );
+        });
+      },
+    });
+  }, [isLoaded, isConnected]);
 
   // Mapa rápido de times por ID
   const teamsMap = useMemo(() => {
@@ -494,6 +655,10 @@ export default function App() {
 
   const handleAdminLogin = (e) => {
     e.preventDefault();
+    if (!isConnected) {
+      setPasswordError('Não foi possível conectar ao banco de dados.');
+      return;
+    }
     if (passwordInput === adminPassword) {
       setIsAdminAuthenticated(true);
       setPasswordInput('');
@@ -511,7 +676,7 @@ export default function App() {
 
   const handleChangeAdminPassword = (e) => {
     e.preventDefault();
-    if (!isAdminAuthenticated) return;
+    if (!isAdminAuthenticated || !isConnected) return;
     const trimmed = newPasswordInput.trim();
     if (trimmed.length < 4) {
       showToast('A nova senha deve ter pelo menos 4 caracteres.', 'error');
@@ -681,7 +846,12 @@ export default function App() {
     }
   };
 
-  const handleSaveUserPick = () => {
+  const handleSaveUserPick = async () => {
+    if (!isConnected) {
+      showToast('Não foi possível conectar ao banco de dados.', 'error');
+      return;
+    }
+
     const cleanName = playerName.trim();
     if (!cleanName) {
       showToast('Digite seu apelido/nick antes de salvar o palpite.', 'error');
@@ -733,36 +903,37 @@ export default function App() {
             zeroThree: draft.zeroThree || [],
           };
 
-    setPicks((prev) => {
-      const existingIdx = prev.findIndex(
-        (p) =>
-          p.stageId === currentStage.id &&
-          p.userName.toLowerCase() === cleanName.toLowerCase()
-      );
-      if (existingIdx >= 0) {
-        const updated = [...prev];
-        updated[existingIdx] = {
-          ...updated[existingIdx],
-          userName: cleanName,
-          stageId: currentStage.id,
-          updatedAt: now,
-          picks: cleanPicks,
-        };
-        return updated;
-      }
-      return [
-        {
-          id: `pick-${Date.now()}`,
-          userName: cleanName,
-          stageId: currentStage.id,
-          updatedAt: now,
-          picks: cleanPicks,
-        },
-        ...prev,
-      ];
-    });
+    const existing = picks.find(
+      (pick) =>
+        pick.stageId === currentStage.id &&
+        pick.userName.toLowerCase() === cleanName.toLowerCase()
+    );
+    const pickToSave = {
+      id: existing?.id || `pick-${Date.now()}`,
+      userName: cleanName,
+      stageId: currentStage.id,
+      updatedAt: now,
+      picks: cleanPicks,
+    };
 
-    showToast(`Palpite de "${cleanName}" salvo para ${currentStage.name}!`);
+    try {
+      const savedPick = await savePick(pickToSave);
+      setPicks((previous) => {
+        const remaining = previous.filter(
+          (pick) =>
+            pick.id !== savedPick.id &&
+            !(
+              pick.stageId === savedPick.stageId &&
+              pick.userName.toLowerCase() === savedPick.userName.toLowerCase()
+            )
+        );
+        return [savedPick, ...remaining];
+      });
+      showToast(`Palpite de "${cleanName}" salvo para ${currentStage.name}!`);
+    } catch (error) {
+      console.error('Erro ao salvar palpite no Supabase:', error);
+      showToast(`Não foi possível salvar o palpite: ${error.message}`, 'error');
+    }
   };
 
   // ============================================================================
@@ -770,6 +941,10 @@ export default function App() {
   // ============================================================================
 
   const requireAdmin = () => {
+    if (!isConnected) {
+      showToast('Não foi possível conectar ao banco de dados.', 'error');
+      return false;
+    }
     if (!isAdminAuthenticated) {
       showToast('Acesso negado: autentique-se com a senha do administrador.', 'error');
       return false;
@@ -1005,7 +1180,7 @@ export default function App() {
   const handleExportBackupJson = () => {
     if (!requireAdmin()) return;
     const data = JSON.stringify(
-      { teams, stages, picks, scoring, adminPassword },
+      { teams, stages, picks, scoring },
       null,
       2
     );
@@ -1013,35 +1188,99 @@ export default function App() {
     showToast('Backup JSON completo copiado para a área de transferência!');
   };
 
-  const handleImportBackupJson = () => {
+  const handleImportBackupJson = async () => {
     if (!requireAdmin()) return;
+    let parsed;
     try {
-      const parsed = JSON.parse(backupJsonInput);
+      parsed = JSON.parse(backupJsonInput);
       if (!Array.isArray(parsed.teams) || !Array.isArray(parsed.stages) || !Array.isArray(parsed.picks)) {
         throw new Error('Estrutura inválida');
       }
+    } catch {
+      showToast('JSON inválido. Verifique os dados colados.', 'error');
+      return;
+    }
+
+    const nextScoring = parsed.scoring
+      ? { ...DEFAULT_SCORING, ...parsed.scoring }
+      : scoring;
+
+    try {
+      await savePoolState({
+        teams: parsed.teams,
+        stages: parsed.stages,
+        scoring: nextScoring,
+      });
+      await replacePicks(parsed.picks);
+      lastSavedStateRef.current = JSON.stringify({
+        teams: parsed.teams,
+        stages: parsed.stages,
+        scoring: nextScoring,
+      });
       setTeams(parsed.teams);
       setStages(parsed.stages);
       setPicks(parsed.picks);
-      if (parsed.scoring) setScoring({ ...DEFAULT_SCORING, ...parsed.scoring });
+      setScoring(nextScoring);
       if (typeof parsed.adminPassword === 'string' && parsed.adminPassword.length >= 4) {
         setAdminPassword(parsed.adminPassword);
       }
       setBackupJsonInput('');
       showToast('Backup JSON restaurado com sucesso!');
-    } catch (err) {
-      showToast('JSON inválido. Verifique os dados colados.', 'error');
+    } catch (error) {
+      console.error('Erro ao restaurar backup no Supabase:', error);
+      showToast(`Não foi possível restaurar o backup: ${error.message}`, 'error');
     }
   };
 
-  const handleClearAllData = () => {
+  const handleClearAllData = async () => {
     if (!requireAdmin()) return;
+    const confirmed = window.confirm(
+      'Isso apagará equipes, fases, resultados e palpites do Supabase para todos, além da cópia e da senha salvas neste navegador. A senha local voltará ao padrão. Deseja continuar?'
+    );
+    if (!confirmed) return;
+
+    const emptyStages = createEmptyStages();
+    try {
+      await savePoolState({
+        teams: [],
+        stages: emptyStages,
+        scoring: DEFAULT_SCORING,
+      });
+      await clearPicks();
+    } catch (error) {
+      console.error('Erro ao limpar dados do Supabase:', error);
+      showToast(`Não foi possível limpar os dados: ${error.message}`, 'error');
+      return;
+    }
+
+    skipLocalCacheRef.current = true;
+    let localCacheCleared = true;
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch (error) {
+      localCacheCleared = false;
+      console.error('Erro ao limpar a cópia local:', error);
+    }
+
+    lastSavedStateRef.current = JSON.stringify({
+      teams: [],
+      stages: emptyStages,
+      scoring: DEFAULT_SCORING,
+    });
     setTeams([]);
-    setStages(createEmptyStages());
+    setStages(emptyStages);
     setPicks([]);
     setScoring(DEFAULT_SCORING);
-    localStorage.removeItem(STORAGE_KEY);
-    showToast('Todos os dados do bolão foram limpos.');
+    setAdminPassword(DEFAULT_ADMIN_PASSWORD);
+    setIsAdminAuthenticated(false);
+    setPasswordInput('');
+    setNewPasswordInput('');
+    showToast(
+      localCacheCleared
+        ? 'Dados do Supabase e cópia local removidos.'
+        : 'Dados do Supabase removidos, mas não foi possível limpar a cópia local.',
+      localCacheCleared ? 'success' : 'error'
+    );
   };
 
   // ============================================================================
@@ -1121,6 +1360,15 @@ export default function App() {
             )}
             <span className="text-sm font-medium leading-snug">{toast.message}</span>
           </div>
+        </div>
+      )}
+
+      {connectionError && (
+        <div
+          role="alert"
+          className="bg-rose-950 border-b border-rose-500/50 px-4 py-3 text-center text-sm text-rose-100"
+        >
+          {connectionError}
         </div>
       )}
 
@@ -1962,10 +2210,10 @@ export default function App() {
                   </div>
                   <div>
                     <h2 className="text-lg font-black text-white">
-                      Acesso Restrito — Administrador
+                      Painel do Administrador
                     </h2>
                     <p className="text-xs text-slate-400">
-                      Digite a senha exclusiva do admin para cadastrar times, definir rodadas e lançar resultados.
+                      Digite a senha do painel para exibir os controles. O banco está configurado para permitir alterações públicas.
                     </p>
                   </div>
                 </div>
@@ -2594,7 +2842,7 @@ export default function App() {
                           Alterar Senha do Administrador
                         </h3>
                         <p className="text-xs text-slate-400">
-                          Apenas quem conhece esta senha pode alterar cadastros e resultados oficiais.
+                          A senha fica neste navegador e só bloqueia a interface; ela não impede alterações diretas no banco.
                         </p>
                         <div className="flex gap-2">
                           <input
@@ -2710,10 +2958,10 @@ export default function App() {
                     {/* Backup JSON */}
                     <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 space-y-3">
                       <h3 className="text-base font-black text-white">
-                        Backup JSON Local
+                        Backup JSON do Bolão
                       </h3>
                       <p className="text-xs text-slate-400">
-                        Copie o JSON para salvar um backup ou cole um JSON anterior para restaurar.
+                        Exporte ou restaure os dados compartilhados. “Zerar Tudo” apaga o Supabase e a cópia local deste navegador após confirmação.
                       </p>
 
                       <div className="flex flex-wrap gap-2">
