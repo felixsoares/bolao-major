@@ -13,9 +13,12 @@ Aplicação React/Vite para palpites do Major de CS2, com dados compartilhados p
 
 As tabelas `teams` e `stage_teams` separam o cadastro global das equipes da ativação de cada equipe em cada fase. `stage_teams.is_active` indica se o time participa daquela fase. O schema mantém leitura e escrita públicas; qualquer pessoa poderá alterar os dados diretamente, e a senha do painel é apenas uma barreira visual. A configuração do Vite só mapeia a URL e as chaves públicas do Supabase, nunca as chaves secretas ou a senha do banco.
 
+O bloqueio de uma rodada impede novos palpites, mas não impede a edição dos resultados oficiais pelo painel. A opção de manter o status preserva o bloqueio atual; ela não reabre a rodada.
+
 ## Comandos
 
 - `npm run dev`: inicia o servidor local.
 - `npm run build`: gera os arquivos de produção na pasta `dist`.
 - `npm run preview`: testa localmente o build de produção.
 - `npm run lint`: executa o Oxlint.
+- `npm test`: executa os testes automatizados com banco simulado.

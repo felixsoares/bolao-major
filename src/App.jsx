@@ -1,11 +1,18 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { isSupabaseConfigured, supabase } from './lib/supabase';
 import {
+  createPoolStateRefresher,
+  officialResultsForStage,
+  reconcileOfficialDraft,
+  serializePoolState,
+} from './lib/poolState';
+import {
   clearPicks,
   deleteAllTeams,
   deleteTeam,
   initializePool,
   loadPoolData,
+  loadPoolState,
   replaceTeams,
   replacePicks,
   saveTeam,
@@ -128,13 +135,15 @@ const createEmptyDraft = (stageType = 'swiss') =>
         zeroThree: [],
       };
 
-const createPoolStateSnapshot = (stages, scoring) => ({
-  stages: stages.map(({ teamIds: _teamIds, ...stage }) => stage),
-  scoring,
-});
-
-const serializePoolState = (stages, scoring) =>
-  JSON.stringify(createPoolStateSnapshot(stages, scoring));
+const containsOfficialSave = (state, pending) => {
+  if (!pending) return false;
+  const stage = state.stages.find((item) => item.id === pending.stageId);
+  return Boolean(
+    stage &&
+      JSON.stringify(officialResultsForStage(stage)) === pending.results &&
+      (!pending.lockStage || stage.isLocked)
+  );
+};
 
 // ============================================================================
 // COMPONENTE DE ESCUDO / LOGO DO TIME (SVG FALLBACK ELEGANTE + IMAGEM)
@@ -300,7 +309,9 @@ export default function App() {
   const lastSavedStateRef = useRef('');
   const currentStateRef = useRef({ stages, scoring });
   const pendingStateRef = useRef('');
+  const pendingOfficialSaveRef = useRef(null);
   const stateSaveQueueRef = useRef(Promise.resolve());
+  const refreshPoolStateRef = useRef(null);
   const skipLocalCacheRef = useRef(false);
 
   // Autenticação do Painel Admin
@@ -329,6 +340,7 @@ export default function App() {
   const [draftOfficialResults, setDraftOfficialResults] = useState(() =>
     createEmptyDraft('swiss')
   );
+  const officialDraftBaselineRef = useRef(null);
 
   // Admin: Cadastro/Edição de Time
   const [newTeamName, setNewTeamName] = useState('');
@@ -475,7 +487,10 @@ export default function App() {
 
     const state = { stages, scoring };
     const serialized = serializePoolState(stages, scoring);
-    if (serialized === lastSavedStateRef.current) return;
+    if (
+      serialized === lastSavedStateRef.current &&
+      (!pendingStateRef.current || pendingStateRef.current === serialized)
+    ) return;
 
     pendingStateRef.current = serialized;
     let saveStarted = false;
@@ -486,13 +501,25 @@ export default function App() {
           await savePoolState(state);
           lastSavedStateRef.current = serialized;
           setConnectionError('');
+          const pendingOfficial = pendingOfficialSaveRef.current;
+          if (containsOfficialSave(state, pendingOfficial)) {
+            pendingOfficialSaveRef.current = null;
+            showToast(`Resultado oficial de "${pendingOfficial.name}" salvo! Pontuações e ranking recalculados.`);
+          }
         })
         .catch((error) => {
           console.error('Erro ao salvar dados no Supabase:', error);
           setConnectionError(`Não foi possível salvar as alterações: ${error.message}`);
+          if (containsOfficialSave(state, pendingOfficialSaveRef.current)) {
+            pendingOfficialSaveRef.current = null;
+            showToast(`Não foi possível salvar o resultado oficial: ${error.message}`, 'error');
+          }
         })
         .finally(() => {
-          if (pendingStateRef.current === serialized) pendingStateRef.current = '';
+          if (pendingStateRef.current === serialized) {
+            pendingStateRef.current = '';
+            refreshPoolStateRef.current?.();
+          }
         });
       stateSaveQueueRef.current = saveOperation;
     }, 300);
@@ -526,9 +553,16 @@ export default function App() {
   useEffect(() => {
     if (!isLoaded || !isConnected || !supabase) return undefined;
 
-    return subscribeToPoolData({
-      onState: (state) => {
-        if (!state) return;
+    const refresher = createPoolStateRefresher({
+      load: loadPoolState,
+      getCurrent: () => currentStateRef.current,
+      getLastSaved: () => lastSavedStateRef.current,
+      hasPendingSave: () => Boolean(pendingStateRef.current),
+      onError: (error) => {
+        console.error('Erro ao atualizar dados do Supabase:', error);
+        setConnectionError(`Não foi possível atualizar os dados: ${error.message}`);
+      },
+      apply: (state) => {
         const currentStages = currentStateRef.current.stages;
         const nextStages = state.stages.map((stage) => ({
           ...stage,
@@ -536,7 +570,6 @@ export default function App() {
             currentStages.find((currentStage) => currentStage.id === stage.id)?.teamIds || [],
         }));
         const serialized = serializePoolState(nextStages, state.scoring);
-        if (pendingStateRef.current) return;
         if (
           serialized ===
           serializePoolState(currentStateRef.current.stages, currentStateRef.current.scoring)
@@ -548,6 +581,11 @@ export default function App() {
         setStages(nextStages);
         setScoring({ ...DEFAULT_SCORING, ...state.scoring });
       },
+    });
+    refreshPoolStateRef.current = refresher.refresh;
+
+    const unsubscribe = subscribeToPoolData({
+      onState: () => refresher.refresh(),
       onTeam: ({ eventType, team, oldId }) => {
         if (eventType === 'DELETE') {
           setTeams((previous) => previous.filter((item) => item.id !== oldId));
@@ -599,6 +637,11 @@ export default function App() {
         });
       },
     });
+    return () => {
+      refresher.dispose();
+      refreshPoolStateRef.current = null;
+      unsubscribe();
+    };
   }, [isLoaded, isConnected]);
 
   // Mapa rápido de times por ID
@@ -620,23 +663,21 @@ export default function App() {
     return stages.find((s) => s.id === adminStageId) || stages[0];
   }, [stages, adminStageId]);
 
-  // Sincronizar rascunho de resultado oficial quando mudar a fase no Admin
+  const officialResultsSignature = adminStage
+    ? JSON.stringify(officialResultsForStage(adminStage))
+    : '';
+
+  // Preserva edições não salvas quando chegam atualizações da fase.
   useEffect(() => {
-    if (!adminStage) return;
-    if (adminStage.type === 'playoffs') {
-      setDraftOfficialResults({
-        champion: adminStage.results?.champion || null,
-        finalists: [...(adminStage.results?.finalists || [])],
-        semifinalists: [...(adminStage.results?.semifinalists || [])],
-      });
-    } else {
-      setDraftOfficialResults({
-        threeZero: [...(adminStage.results?.threeZero || [])],
-        advance: [...(adminStage.results?.advance || [])],
-        zeroThree: [...(adminStage.results?.zeroThree || [])],
-      });
-    }
-  }, [adminStage]);
+    if (!officialResultsSignature) return;
+    const next = {
+      stageId: adminStageId,
+      results: JSON.parse(officialResultsSignature),
+    };
+    const previous = officialDraftBaselineRef.current;
+    officialDraftBaselineRef.current = next;
+    setDraftOfficialResults((draft) => reconcileOfficialDraft(draft, previous, next));
+  }, [adminStageId, officialResultsSignature]);
 
   // Times cadastrados pelo admin na fase atual do usuário
   const stageTeams = useMemo(() => {
@@ -1254,30 +1295,41 @@ export default function App() {
   const handleSaveOfficialResults = (lockStageAfterSave = true) => {
     if (!requireAdmin() || !adminStage) return;
 
+    const results = officialResultsForStage({
+      type: adminStage.type,
+      results: draftOfficialResults,
+    });
+    const nextStages = stages.map((stage) =>
+      stage.id === adminStage.id
+        ? {
+            ...stage,
+            isLocked: lockStageAfterSave ? true : stage.isLocked,
+            results,
+          }
+        : stage
+    );
+    const serialized = serializePoolState(nextStages, scoring);
+    if (serialized === lastSavedStateRef.current && !pendingStateRef.current) {
+      showToast(`Resultado oficial de "${adminStage.name}" já está salvo.`);
+      return;
+    }
+
+    pendingOfficialSaveRef.current = {
+      stageId: adminStage.id,
+      name: adminStage.name,
+      results: JSON.stringify(results),
+      lockStage: lockStageAfterSave,
+    };
+    if (!pendingStateRef.current) pendingStateRef.current = serialized;
     setStages((prev) =>
       prev.map((st) => {
         if (st.id !== adminStage.id) return st;
         return {
           ...st,
           isLocked: lockStageAfterSave ? true : st.isLocked,
-          results:
-            st.type === 'playoffs'
-              ? {
-                  champion: draftOfficialResults.champion || null,
-                  finalists: draftOfficialResults.finalists || [],
-                  semifinalists: draftOfficialResults.semifinalists || [],
-                }
-              : {
-                  threeZero: draftOfficialResults.threeZero || [],
-                  advance: draftOfficialResults.advance || [],
-                  zeroThree: draftOfficialResults.zeroThree || [],
-                },
+          results,
         };
       })
-    );
-
-    showToast(
-      `Resultado oficial de "${adminStage.name}" salvo! Pontuações e ranking recalculados.`
     );
   };
 
@@ -2537,7 +2589,8 @@ export default function App() {
                           Registrar Resultados Oficiais da Rodada
                         </h2>
                         <p className="text-xs text-slate-400 mt-0.5">
-                          Ao salvar, as pontuações de todos os usuários e o ranking são recalculados automaticamente.
+                          Os resultados podem ser alterados mesmo com os palpites bloqueados.
+                          Ao salvar, as pontuações e o ranking são recalculados automaticamente.
                         </p>
                       </div>
 
@@ -2790,14 +2843,14 @@ export default function App() {
                             onClick={() => handleSaveOfficialResults(false)}
                             className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs sm:text-sm"
                           >
-                            Salvar Resultado (Manter Rodada Aberta)
+                            Salvar Resultado (Manter Status da Rodada)
                           </button>
                           <button
                             onClick={() => handleSaveOfficialResults(true)}
                             className="px-5 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-black text-xs sm:text-sm flex items-center gap-2"
                           >
                             <CheckCircle2 className="w-4 h-4" />
-                            <span>Salvar Resultado Oficial &amp; Encerrar Rodada</span>
+                            <span>Salvar Resultado Oficial &amp; Bloquear Palpites</span>
                           </button>
                         </div>
                       </>

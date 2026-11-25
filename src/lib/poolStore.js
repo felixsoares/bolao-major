@@ -1,4 +1,5 @@
 import { supabase } from './supabase';
+import { serializePoolState } from './poolState';
 
 const STATE_ID = 'main';
 
@@ -44,6 +45,20 @@ const fromDatabaseTeam = (team) => ({
   name: team.name,
   logoUrl: team.logo_url || '',
 });
+
+export const loadPoolState = async () => {
+  const { data, error } = await requireSupabase()
+    .from('pool_state')
+    .select('stages, scoring')
+    .eq('id', STATE_ID)
+    .maybeSingle();
+
+  if (error) throw error;
+  if (!data) {
+    throw new Error('A tabela pool_state não tem o registro inicial. Execute o SQL do projeto.');
+  }
+  return data;
+};
 
 export const loadPoolData = async () => {
   const client = requireSupabase();
@@ -112,15 +127,25 @@ export const initializePool = async ({ teams, stages, scoring, picks }) => {
 export const savePoolState = async ({ stages, scoring }) => {
   const client = requireSupabase();
   const stagesWithoutTeamIds = stages.map(({ teamIds: _teamIds, ...stage }) => stage);
-  const { error } = await client.from('pool_state').upsert({
-    id: STATE_ID,
-    stages: stagesWithoutTeamIds,
-    scoring,
-    initialized: true,
-    updated_at: new Date().toISOString(),
-  });
+  const { data, error } = await client
+    .from('pool_state')
+    .update({
+      stages: stagesWithoutTeamIds,
+      scoring,
+      initialized: true,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', STATE_ID)
+    .select('stages, scoring')
+    .single();
 
   if (error) throw error;
+  if (
+    serializePoolState(data.stages, data.scoring) !==
+    serializePoolState(stagesWithoutTeamIds, scoring)
+  ) {
+    throw new Error('O banco retornou dados diferentes dos enviados. Tente salvar novamente.');
+  }
 };
 
 export const saveTeam = async (team, stageIds) => {
